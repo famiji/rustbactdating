@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+# checkpoints and data must never be committed
+*.ckpt
+*.bin
+*.rds
+*.nwk
+*.tsv
+*.tre
+.DS_Store
+._*
