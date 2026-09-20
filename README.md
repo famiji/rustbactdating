@@ -26,12 +26,42 @@ touching the node whose date changed, which is `O(degree(node))` per move.
 - R-compatible distributions (`dgamma`, `pgamma`, `dnbinom`, `dpois`, RNGs),
   unit-tested against R's values to 1e-6
 
-## Requirements
+## Install
 
-- Rust 1.70 or newer (`rustup` installs it; `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- A dated phylogeny and a table of sampling dates (see **Inputs** below)
+### 1. Get a Rust toolchain
 
-No other dependencies: the binary is self-contained and reads plain text files.
+If `cargo --version` already works, skip this. Otherwise install it with
+[rustup](https://rustup.rs) (any 1.70+ toolchain is fine):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# then either open a new shell, or:
+source "$HOME/.cargo/env"
+```
+
+### 2. Clone and build
+
+```bash
+git clone https://github.com/famiji/rustbactdating.git
+cd rustbactdating
+cargo build --release
+```
+
+The binary is written to `target/release/rustbact`. Building takes a minute or
+two; there are no dependencies to install beyond the Rust toolchain itself.
+
+### 3. Check it runs
+
+```bash
+./target/release/rustbact            # prints usage
+cargo test --release                 # 14 tests: distributions, Newick, likelihood invariant
+```
+
+Both should complete without errors. `cargo test` finishes in well under a
+second once the build is warm.
+
+Then go to **Inputs** to prepare your two files, and **Run** for the actual
+analysis commands.
 
 ## Inputs
 
@@ -82,20 +112,6 @@ is required to prepare or run the analysis.
    Tip labels must match the tree exactly. Mismatched labels are silently
    unmatched, so check the `dates matched: n/total` line that is printed at
    startup.
-
-## Build
-
-```bash
-cargo build --release
-```
-
-The binary is written to `target/release/rustbact`. The test suite (14 tests
-covering the distributions, Newick parsing, and the incremental-likelihood
-invariant) runs with:
-
-```bash
-cargo test --release
-```
 
 ## Run
 
