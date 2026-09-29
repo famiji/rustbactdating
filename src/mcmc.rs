@@ -22,6 +22,11 @@ pub struct Config {
     pub use_coal_prior: bool,
     pub acceptance_target: f64,
     pub tune: bool,
+    /// verify the incrementally maintained log-likelihood against a full
+    /// recomputation every few hundred iterations (diagnostic)
+    pub check_loglik: bool,
+    /// use per-branch `unrec` values in the likelihood (ncol == 5 tables)
+    pub use_rec: bool,
 }
 
 impl Default for Config {
@@ -38,6 +43,8 @@ impl Default for Config {
             use_coal_prior: true,
             acceptance_target: 0.234,
             tune: true,
+            check_loglik: false,
+            use_rec: false,
         }
     }
 }
@@ -65,6 +72,13 @@ pub struct State {
     /// date range lower/upper bound for each tip (0-based)
     pub range_lo: Vec<f64>,
     pub range_hi: Vec<f64>,
+    /// how many times each root move was accepted (diagnostics)
+    pub root_branch_accepted: usize,
+    pub root_branch_tried: usize,
+    pub root_slide_accepted: usize,
+    pub root_skip_tip: usize,
+    pub root_skip_children: usize,
+    pub root_last_mh: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +104,15 @@ pub struct Mcmc<'a> {
     /// per-tip date bounds (for missing dates these are [min_date, max_date])
     range_lo: Vec<f64>,
     range_hi: Vec<f64>,
+    /// root-move diagnostic counters
+    root_branch_accepted: usize,
+    root_branch_tried: usize,
+    root_slide_accepted: usize,
+    root_skip_tip: usize,
+    root_skip_children: usize,
+    root_last_mh: f64,
+    /// per-node unrecombined fraction (1-based node id), used when use_rec is on
+    unrec: Vec<f64>,
 }
 
 impl<'a> Mcmc<'a> {
@@ -138,7 +161,21 @@ impl<'a> Mcmc<'a> {
             mis_dates,
             range_lo,
             range_hi,
+            root_branch_accepted: 0,
+            root_branch_tried: 0,
+            root_slide_accepted: 0,
+            root_skip_tip: 0,
+            root_skip_children: 0,
+            root_last_mh: f64::NAN,
+            unrec: Vec::new(),
         }
+    }
+
+    /// Attach per-branch unrecombined fractions (1-based node id -> fraction).
+    /// Enables the `ncol == 5` table layout when `cfg.use_rec` is set.
+    pub fn with_unrec(mut self, unrec: Vec<f64>) -> Self {
+        self.unrec = unrec;
+        self
     }
 
     #[inline]
@@ -156,14 +193,168 @@ impl<'a> Mcmc<'a> {
     }
 
     /// Local log-likelihood for the branch above `node` and above its children.
+    /// `children` is passed in because the topology changes when the root moves.
     #[inline]
-    fn local_loglik(&self, tab: &Tab, node: usize, mu: f64, sigma: f64) -> f64 {
+    fn local_loglik(
+        &self,
+        tab: &Tab,
+        node: usize,
+        children: &[Vec<usize>],
+        mu: f64,
+        sigma: f64,
+    ) -> f64 {
         let i = node - 1;
         let mut acc = branch_loglik(&self.cfg.model, tab, i, mu, sigma);
-        for &c in &self.children[node] {
+        for &c in &children[node] {
             acc += branch_loglik(&self.cfg.model, tab, c - 1, mu, sigma);
         }
         acc
+    }
+
+    /// Rebuild the children lists from `tab.father`.
+    fn rebuild_children(tab: &Tab, children: &mut [Vec<usize>]) {
+        for v in children.iter_mut() {
+            v.clear();
+        }
+        for node in 1..=tab.nrow {
+            let f = tab.father[node - 1];
+            if f > 0 {
+                children[f].push(node);
+            }
+        }
+    }
+
+    /// Row index (0-based) of the current root: the node with no father.
+    #[inline]
+    fn root_row(tab: &Tab) -> usize {
+        (1..=tab.nrow)
+            .find(|&node| tab.father[node - 1] == 0)
+            .map(|node| node - 1)
+            .unwrap_or(tab.root_idx)
+    }
+
+    /// Encode the current root as a single number (sorted pair of its two children),
+    /// so the most frequent root can be recovered from the MCMC record.
+    #[inline]
+    fn root_key(tab: &Tab, children: &[Vec<usize>]) -> f64 {
+        let r = Self::root_row(tab) + 1;
+        let ch = &children[r];
+        if ch.len() >= 2 {
+            let (a, b) = (ch[0].min(ch[1]), ch[0].max(ch[1]));
+            a as f64 * 1_000_000.0 + b as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Move the root along its current branch, by redistributing the total branch
+    /// length between the two children of the root (BactDating's first root move).
+    fn move_root_along_branch(
+        &mut self,
+        tab: &mut Tab,
+        children: &[Vec<usize>],
+        loglik: &mut f64,
+        mu: f64,
+        sigma: f64,
+    ) {
+        let r = Self::root_row(tab) + 1;
+        let sides = &children[r];
+        if sides.len() != 2 {
+            return;
+        }
+        let (s1, s2) = (sides[0], sides[1]);
+        let old1 = tab.subs[s1 - 1];
+        let old2 = tab.subs[s2 - 1];
+        let tot = old1 + old2;
+        let x: f64 = runif(&mut self.rng);
+        tab.subs[s1 - 1] = tot * x;
+        tab.subs[s2 - 1] = tot * (1.0 - x);
+        let l2 = self.loglik(tab, mu, sigma);
+        if runif(&mut self.rng).ln() < l2 - *loglik {
+            *loglik = l2;
+            self.root_slide_accepted += 1;
+        } else {
+            tab.subs[s1 - 1] = old1;
+            tab.subs[s2 - 1] = old2;
+        }
+    }
+
+    /// Move the root onto a neighbouring branch (BactDating's second root move).
+    /// This is a topology change: the younger root child becomes the new root's
+    /// ancestor, taking one of its children with it.
+    fn move_root_branch(
+        &mut self,
+        tab: &mut Tab,
+        children: &mut Vec<Vec<usize>>,
+        loglik: &mut f64,
+        mu: f64,
+        sigma: f64,
+    ) {
+        self.root_branch_tried += 1;
+        let root = Self::root_row(tab) + 1;
+        let sides = &children[root];
+        if sides.len() != 2 {
+            return;
+        }
+        let (s1, s2) = (sides[0], sides[1]);
+        // left = the younger child (smaller date), right = the older one
+        let (left, right) = if tab.date[s1 - 1] < tab.date[s2 - 1] {
+            (s1, s2)
+        } else {
+            (s2, s1)
+        };
+        let n = tab.ntip;
+        if left <= n {
+            // the younger child is a tip; nothing to move
+            self.root_skip_tip += 1;
+            return;
+        }
+        let ab = children[left].clone();
+        if ab.len() != 2 {
+            self.root_skip_children += 1;
+            return;
+        }
+        let a = if runif(&mut self.rng) < 0.5 { ab[0] } else { ab[1] };
+
+        // save state (tab row copies, as R does with oldtab)
+        let old_father_a = tab.father[a - 1];
+        let old_father_right = tab.father[right - 1];
+        let old_subs_a = tab.subs[a - 1];
+        let old_subs_left = tab.subs[left - 1];
+        let old_subs_right = tab.subs[right - 1];
+
+        // apply the move
+        tab.father[a - 1] = root;
+        tab.father[right - 1] = left;
+        let x: f64 = runif(&mut self.rng);
+        tab.subs[a - 1] = old_subs_a * x;
+        tab.subs[left - 1] = old_subs_a * (1.0 - x);
+        tab.subs[right - 1] = old_subs_right + old_subs_left;
+        if tab.ncol == 5 {
+            tab.unrec[left - 1] = tab.unrec[a - 1];
+        }
+        Self::rebuild_children(tab, children);
+
+        let l2 = self.loglik(tab, mu, sigma);
+        let num = if old_subs_a == 0.0 { 1.0 } else { old_subs_a };
+        let den = if tab.subs[right - 1] == 0.0 {
+            1.0
+        } else {
+            tab.subs[right - 1]
+        };
+        let jac = (num / den).ln();
+        self.root_last_mh = l2 - *loglik + jac;
+        if runif(&mut self.rng).ln() < l2 - *loglik + jac {
+            *loglik = l2;
+            self.root_branch_accepted += 1;
+        } else {
+            tab.father[a - 1] = old_father_a;
+            tab.father[right - 1] = old_father_right;
+            tab.subs[a - 1] = old_subs_a;
+            tab.subs[left - 1] = old_subs_left;
+            tab.subs[right - 1] = old_subs_right;
+            Self::rebuild_children(tab, children);
+        }
     }
 
     /// Sample alpha via the same inverse-gamma Gibbs move as R's bactdate.
@@ -211,7 +402,14 @@ impl<'a> Mcmc<'a> {
         let mut subs = vec![0.0f64; nrow];
         let mut date = vec![0.0f64; nrow];
         let mut father = vec![0usize; nrow];
-        let unrec = vec![1.0f64; nrow];
+        let mut unrec = vec![1.0f64; nrow];
+        if self.cfg.use_rec && !self.unrec.is_empty() {
+            for node in 1..=nrow {
+                if let Some(u) = self.unrec.get(node) {
+                    unrec[node - 1] = u.clamp(0.0, 1.0);
+                }
+            }
+        }
         for node in 1..=nrow {
             let i = node - 1;
             subs[i] = self.tree.edge_length[node];
@@ -231,6 +429,10 @@ impl<'a> Mcmc<'a> {
         };
 
         let mut tab = Tab::new(n, nnode, subs, date, father, unrec, self.cfg.min_bralen, root_idx);
+        // ncol == 5 tells every likelihood branch that unrec is meaningful
+        if self.cfg.use_rec && !self.unrec.is_empty() {
+            tab.ncol = 5;
+        }
 
         // internal node dates in postorder (children before parents)
         for &node in &self.tree.postorder() {
@@ -329,6 +531,12 @@ impl<'a> Mcmc<'a> {
                     mis_dates: self.mis_dates.clone(),
                     range_lo: self.range_lo.clone(),
                     range_hi: self.range_hi.clone(),
+                    root_branch_accepted: 0,
+                    root_branch_tried: 0,
+                    root_slide_accepted: 0,
+                    root_skip_tip: 0,
+                    root_skip_children: 0,
+                    root_last_mh: f64::NAN,
                 }
             }
         };
@@ -344,6 +552,9 @@ impl<'a> Mcmc<'a> {
             self.cfg.min_bralen,
             root_idx,
         );
+        if self.cfg.use_rec && !self.unrec.is_empty() {
+            tab.ncol = 5;
+        }
 
         let mut mu = st.mu;
         let mut sigma = st.sigma;
@@ -353,6 +564,9 @@ impl<'a> Mcmc<'a> {
 
         let mut nodes_desc: Vec<f64> = (n..nrow).map(|i| tab.date[i]).collect();
         sort_desc(&mut nodes_desc);
+
+        // topology changes when the root moves, so keep a local mutable copy
+        let mut children: Vec<Vec<usize>> = self.children.clone();
 
         let thin = self.cfg.thin.max(1);
         let delta = 1.0 / self.cfg.acceptance_target / (1.0 - self.cfg.acceptance_target);
@@ -371,10 +585,24 @@ impl<'a> Mcmc<'a> {
         }
 
         // internal nodes (0-based rows), excluding root handled by root moves
-        let internal_nodes: Vec<usize> = (n + 1..=nrow).filter(|&node| node - 1 != root_idx).collect();
+        // all internal nodes; the current root is skipped inside the loop because
+        // it has no father branch to constrain it
+        let internal_nodes: Vec<usize> = (n + 1..=nrow).collect();
 
         let start = st.n_done;
         for it in (start + 1)..=(self.cfg.nb_its) {
+            if self.cfg.check_loglik && it % 200 == 0 {
+                let fresh = self.loglik(&tab, mu, sigma);
+                let drift = loglik - fresh;
+                if drift.abs() > 1e-6 {
+                    eprintln!(
+                        "[loglik-drift] it={} incremental={:.6} full={:.6} diff={:.6}",
+                        it, loglik, fresh, drift
+                    );
+                    loglik = fresh; // resync so later comparisons are fair
+                }
+            }
+
             if it % thin == 0 {
                 let mut row: Vec<f64> = Vec::with_capacity(nrow * 3 + 6);
                 row.extend_from_slice(&tab.date);
@@ -385,7 +613,7 @@ impl<'a> Mcmc<'a> {
                 row.push(sigma);
                 row.push(alpha);
                 row.push(logprior);
-                row.push(0.0); // root edge marker (kept for column compatibility)
+                row.push(Self::root_key(&tab, &children)); // current root position
                 record.push(row);
             }
 
@@ -408,7 +636,15 @@ impl<'a> Mcmc<'a> {
             }
 
             // ---- sigma ----
-            if self.cfg.update_sigma && sigma > 0.0 {
+            // Only the models that actually carry a per-branch rate variance
+            // should update sigma: `arc` (variance = sigma), `carc`/`negbin`/
+            // `relaxedgamma` (variance = sigma^2). For poisson and strictgamma
+            // sigma is not a parameter, so proposing it would just add noise.
+            let models_with_sigma = matches!(
+                self.cfg.model.as_str(),
+                "arc" | "carc" | "negbin" | "relaxedgamma" | "mixedgamma" | "mixedcarc"
+            );
+            if self.cfg.update_sigma && sigma > 0.0 && models_with_sigma {
                 let sigma2 = rnorm(&mut self.rng, sigma, st.sd_sigma).abs();
                 if sigma2 > 0.0 {
                     let l2 = self.loglik(&tab, mu, sigma2);
@@ -438,11 +674,14 @@ impl<'a> Mcmc<'a> {
                 let old = tab.date[i];
                 let new = old + rnorm(&mut self.rng, 0.0, st.sd_dates);
                 let f = tab.father[i];
-                let father_date = if f > 0 { tab.date[f - 1] } else { f64::INFINITY };
+                // Smaller date = older. A node must stay younger than its father
+                // and older than its children, so the valid window is
+                // [father_date, min_child]. The root has no father, hence -inf.
+                let father_date = if f > 0 { tab.date[f - 1] } else { f64::NEG_INFINITY };
                 let min_child = {
-                    let ch = &self.children[node];
+                    let ch = &children[node];
                     if ch.is_empty() {
-                        f64::NEG_INFINITY
+                        f64::INFINITY
                     } else {
                         ch.iter().map(|&c| tab.date[c - 1]).fold(f64::INFINITY, f64::min)
                     }
@@ -451,10 +690,10 @@ impl<'a> Mcmc<'a> {
                 // tuning factor (min(1, exp(-Inf)) = 0). Skipping the tuning update
                 // would make sd_dates drift differently from the reference.
                 let mut mh = f64::NEG_INFINITY;
-                if !(new > father_date || new < min_child) {
-                    let l_before = self.local_loglik(&tab, node, mu, sigma);
+                if !(new < father_date || new > min_child) {
+                    let l_before = self.local_loglik(&tab, node, &children, mu, sigma);
                     tab.date[i] = new;
-                    let l_after = self.local_loglik(&tab, node, mu, sigma);
+                    let l_after = self.local_loglik(&tab, node, &children, mu, sigma);
                     let l2 = loglik - l_before + l_after;
                     change_in_ordered_vec(&mut nodes_desc, old, new);
                     let p2 = self.logprior(&leaves_desc, &nodes_desc, alpha);
@@ -503,6 +742,14 @@ impl<'a> Mcmc<'a> {
                     change_in_ordered_vec(&mut leaves_desc, new, old);
                 }
             }
+
+            // ---- root moves (mirrors BactDating's updateRoot=TRUE) ----
+            // 1: slide the root along the branch between its two children
+            // 2: move the root onto a neighbouring branch (topology change)
+            if self.cfg.update_root {
+                self.move_root_along_branch(&mut tab, &children, &mut loglik, mu, sigma);
+                self.move_root_branch(&mut tab, &mut children, &mut loglik, mu, sigma);
+            }
         }
 
         st.mu = mu;
@@ -516,6 +763,12 @@ impl<'a> Mcmc<'a> {
         st.unrec = tab.unrec.clone();
         st.n_done = self.cfg.nb_its;
         st.record = record;
+        st.root_slide_accepted = self.root_slide_accepted;
+        st.root_branch_accepted = self.root_branch_accepted;
+        st.root_branch_tried = self.root_branch_tried;
+        st.root_skip_tip = self.root_skip_tip;
+        st.root_skip_children = self.root_skip_children;
+        st.root_last_mh = self.root_last_mh;
 
         Checkpoint {
             cfg: self.cfg.clone(),

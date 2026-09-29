@@ -67,7 +67,10 @@ impl Tab {
 
 /// Log-likelihood contribution of the branch above node `i` (0-based).
 pub fn branch_loglik(model: &str, tab: &Tab, i: usize, mu: f64, sigma: f64) -> f64 {
-    if i == tab.root_idx {
+    // The root has no branch above it. `father == 0` is checked rather than a
+    // fixed index because the root moves during the MCMC (updateRoot), so
+    // `tab.root_idx` is only the root of the *initial* tree.
+    if tab.father[i] == 0 {
         return 0.0;
     }
     let (unrec, l) = tab.unrec_duration(i);

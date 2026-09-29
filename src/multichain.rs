@@ -17,6 +17,7 @@ pub fn run_chains(
     base_seed: u64,
     n_chains: usize,
     resume: Option<Vec<Option<Checkpoint>>>,
+    unrec: Option<Vec<f64>>,
 ) -> Vec<Checkpoint> {
     let n = n_chains.max(1);
     let mut results: Vec<Option<Checkpoint>> = (0..n).map(|_| None).collect();
@@ -31,8 +32,12 @@ pub fn run_chains(
                 let mut cfg_i = cfg.clone();
                 // record the chain's own seed so runs are reproducible
                 let dates_i = dates.to_vec();
+                let unrec_i = unrec.clone();
                 scope.spawn(move || {
                     let mut m = Mcmc::new(tree, dates_i, cfg_i.clone(), seed);
+                    if let Some(u) = unrec_i {
+                        m = m.with_unrec(u);
+                    }
                     cfg_i = m.cfg.clone();
                     m.run(ck)
                 })

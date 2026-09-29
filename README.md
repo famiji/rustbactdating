@@ -25,6 +25,12 @@ touching the node whose date changed, which is `O(degree(node))` per move.
 - Checkpoint / resume: stop and continue a chain without losing samples
 - R-compatible distributions (`dgamma`, `pgamma`, `dnbinom`, `dpois`, RNGs),
   unit-tested against R's values to 1e-6
+- Root position estimated by the MCMC (`updateRoot`), plus automatic rooting of
+  unrooted input at the root that maximises the date/root-to-tip correlation
+- Dating output: time-scaled tree, per-node dates with 95% credible intervals,
+  root date and DIC
+- `--gubbins` / `--cfml` load a run's output directly, including the per-branch
+  recombination fractions (`--use-rec`)
 
 ## Install
 
@@ -126,6 +132,19 @@ is required to prepare or run the analysis.
 # extend every chain by another 10,000 iterations, reusing all stored samples
 ./target/release/rustbact tree.nwk dates.tsv 20000 10 --chains 8 \
     --resume run.bin.0,run.bin.1,run.bin.2,run.bin.3,run.bin.4,run.bin.5,run.bin.6,run.bin.7
+
+# write dating results (tree, node dates with CIs, summary)
+./target/release/rustbact tree.nwk dates.tsv 20000 10 --chains 4 \
+    --out-prefix results
+#   results.dated_tree.nwk   time-scaled tree (branch lengths in years)
+#   results.node_dates.tsv   posterior mean + 95% CI per node
+#   results.summary.txt      parameters, root date, DIC
+
+# take the tree and recombination fractions straight from a Gubbins run
+./target/release/rustbact --gubbins gubbins_run dates.tsv 20000 10 \
+    --use-rec --out-prefix results
+# same for ClonalFrameML (branch lengths are scaled to substitutions for you)
+./target/release/rustbact --cfml cfml_run dates.tsv 20000 10 --use-rec
 ```
 
 Positional arguments are `tree`, `dates`, then optionally `nbIts` (default
@@ -140,6 +159,11 @@ Positional arguments are `tree`, `dates`, then optionally `nbIts` (default
 | `--resume PATH[,PATH…]` | resume chain(s) from checkpoint(s), one per chain |
 | `--scale-lengths L` | multiply branch lengths by `L` before running; use the number of alignment sites to convert a per-site tree to substitutions |
 | `--check-lengths` | print the total branch length, warn if it looks per-site, and exit |
+| `--out-prefix P` | write `P.dated_tree.nwk`, `P.node_dates.tsv`, `P.summary.txt` |
+| `--gubbins PREFIX` | read tree and per-branch recombination fractions from a Gubbins run |
+| `--cfml PREFIX` | same for a ClonalFrameML run (lengths scaled to substitutions) |
+| `--use-rec` | apply the loaded recombination fractions in the likelihood |
+| `--mtry N` | search resolution when rooting an unrooted tree (default 5, 0 disables) |
 
 On completion it prints a per-parameter summary (mean, sd, 95% HPD,
 ESS per chain, total ESS, and split-R-hat across chains):
@@ -196,12 +220,13 @@ Two issues in the R/C++ implementation surfaced while validating:
 
 ## Status / limitations
 
-- The root position is fixed at the input tree's root (`updateRoot` moves are
-  not implemented).
-- Output is the parameter summary plus checkpoints; confidence intervals on
-  node dates, DIC and the annotated tree are not yet exported.
-- `loadGubbins()` / `loadCFML()` equivalents (recombination-aware inputs) are
-  not implemented.
+- Output is the time-scaled tree, per-node dates with credible intervals, the
+  root date and DIC, plus checkpoints for resuming. A `treedata`-style object
+  for direct plotting in R is not produced — use the exported Newick/TSV.
+- The re-rooting search evaluates a fixed grid of positions per edge rather than
+  the continuous optimum; `--mtry` controls the grid density.
+- Non-`arc` models have their likelihoods implemented and tested, but the
+  tuning targets and `sigma` behaviour were calibrated against `arc`.
 
 The distribution functions are unit-tested against values printed by R
 (`dgamma`, `pgamma`, `dnbinom`, `dpois`, `lgamma`, and the coalescent prior), and

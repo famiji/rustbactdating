@@ -93,6 +93,258 @@ impl Tree {
         self.total_nodes() - 1
     }
 
+    /// True when the root has exactly two children, i.e. the tree is rooted.
+    /// A trifurcating root means the tree is unrooted.
+    pub fn is_rooted(&self) -> bool {
+        self.children[self.root].len() == 2
+    }
+
+    /// Adjacency list: for each node, its neighbours and the branch length.
+    pub fn adjacency(&self) -> Vec<Vec<(usize, f64)>> {
+        let total = self.total_nodes();
+        let mut adj = vec![Vec::new(); total + 1];
+        for node in 1..=total {
+            let p = self.parent[node];
+            if p > 0 {
+                adj[p].push((node, self.edge_length[node]));
+                adj[node].push((p, self.edge_length[node]));
+            }
+        }
+        adj
+    }
+
+    /// Distances from `src` to every node, without crossing the edge (src, blocked).
+    /// `dist[0]` is unused; `dist[t]` for t <= ntip is the root-to-tip distance
+    /// that would result from rooting along that edge.
+    /// Distance from `u` to every node, plus which side of the edge (u, v) each
+    /// node lies on: +1 for u's side (including u), -1 for v's side (including v).
+    /// The edge (u, v) itself is not crossed in either direction.
+    fn dist_and_side(
+        &self,
+        adj: &[Vec<(usize, f64)>],
+        u: usize,
+        v: usize,
+    ) -> (Vec<f64>, Vec<i8>) {
+        let total = self.total_nodes();
+        let cut = adj[u]
+            .iter()
+            .find(|(w, _)| *w == v)
+            .map(|(_, l)| *l)
+            .unwrap_or(0.0);
+        let mut dist = vec![f64::NAN; total + 1];
+        let mut side = vec![0i8; total + 1];
+
+        // u's side: distances measured from u
+        dist[u] = 0.0;
+        side[u] = 1;
+        let mut stack = vec![u];
+        while let Some(w) = stack.pop() {
+            for &(z, l) in &adj[w] {
+                if z == v && w == u {
+                    continue; // do not cross the cut edge
+                }
+                if !dist[z].is_nan() {
+                    continue;
+                }
+                dist[z] = dist[w] + l;
+                side[z] = 1;
+                stack.push(z);
+            }
+        }
+
+        // v's side: distances still measured from u (so add the cut length)
+        dist[v] = cut;
+        side[v] = -1;
+        let mut stack = vec![v];
+        while let Some(w) = stack.pop() {
+            for &(z, l) in &adj[w] {
+                if z == u && w == v {
+                    continue;
+                }
+                if !dist[z].is_nan() {
+                    continue;
+                }
+                dist[z] = dist[w] + l;
+                side[z] = -1;
+                stack.push(z);
+            }
+        }
+        (dist, side)
+    }
+
+    /// Re-root the tree in the middle of edge (u, v): the new root's children are
+    /// `u` (branch `x * L`) and `v` (branch `(1 - x) * L`).
+    ///
+    /// Tips keep their ids so that caller-supplied dates stay aligned. Nodes are
+    /// renumbered compactly, which also drops the old root if it ends up
+    /// unifurcating.
+    pub fn reroot_at_edge(&self, adj: &[Vec<(usize, f64)>], u: usize, v: usize, x: f64) -> Tree {
+        let total = self.total_nodes();
+        let ntip = self.ntip;
+        let split_len = adj[u]
+            .iter()
+            .find(|(w, _)| *w == v)
+            .map(|(_, l)| *l)
+            .unwrap_or(0.0);
+
+        let tmp_root = total + 1;
+        let mut parent = vec![0usize; total + 2];
+        let mut blen = vec![0.0f64; total + 2];
+        parent[u] = tmp_root;
+        blen[u] = x * split_len;
+        parent[v] = tmp_root;
+        blen[v] = (1.0 - x) * split_len;
+
+        // orient the two sides away from the cut edge
+        let mut visited = vec![false; total + 2];
+        visited[tmp_root] = true;
+        visited[u] = true;
+        visited[v] = true;
+        for &start in &[u, v] {
+            let mut stack = vec![start];
+            while let Some(w) = stack.pop() {
+                for &(z, l) in &adj[w] {
+                    if visited[z] {
+                        continue;
+                    }
+                    visited[z] = true;
+                    parent[z] = w;
+                    blen[z] = l;
+                    stack.push(z);
+                }
+            }
+        }
+
+        // renumber: tips keep 1..=ntip, internals get ntip+1, ntip+2, ... in BFS order
+        let mut children_tmp: Vec<Vec<usize>> = vec![Vec::new(); total + 2];
+        for w in 1..=total {
+            if parent[w] > 0 {
+                children_tmp[parent[w]].push(w);
+            }
+        }
+        let mut id_map = vec![0usize; total + 2];
+        for t in 1..=ntip {
+            id_map[t] = t;
+        }
+        let mut next_internal = ntip + 1;
+        let mut queue = std::collections::VecDeque::from([tmp_root]);
+        id_map[tmp_root] = next_internal;
+        next_internal += 1;
+        let mut order = vec![tmp_root];
+        while let Some(w) = queue.pop_front() {
+            for &c in &children_tmp[w] {
+                // tips keep their original ids so caller dates stay aligned;
+                // only internal nodes get freshly assigned numbers
+                if c > ntip {
+                    id_map[c] = next_internal;
+                    next_internal += 1;
+                }
+                order.push(c);
+                queue.push_back(c);
+            }
+        }
+
+        let mut edges = Vec::with_capacity(order.len());
+        for &w in &order {
+            if w == tmp_root {
+                continue;
+            }
+            edges.push((id_map[parent[w]], id_map[w], blen[w]));
+        }
+        Tree::from_edges(self.tip_labels.clone(), edges, id_map[tmp_root])
+    }
+
+    /// Pick the root that maximises the correlation between sampling dates and
+    /// root-to-tip distances (BactDating's `initRoot`).
+    ///
+    /// For a candidate root at fraction `x` along edge (u, v) with length `L`,
+    /// every tip's root-to-tip distance is `d_u(t) + s(t) * x * L`, where
+    /// `d_u(t)` is the distance from `u` and `s(t)` is +1 on u's side and -1 on
+    /// v's side. The correlation is therefore a ratio of quadratics in `x`, so
+    /// the per-edge cost is one O(n) distance pass plus cheap arithmetic per
+    /// candidate position.
+    pub fn init_root(&self, dates: &[f64], mtry: usize) -> Tree {
+        let total = self.total_nodes();
+        let ntip = self.ntip;
+        let adj = self.adjacency();
+        let mean_edge = if self.n_edges() > 0 {
+            self.total_length() / self.n_edges() as f64
+        } else {
+            1.0
+        };
+
+        // only dated tips contribute to the correlation
+        let mut idx: Vec<usize> = Vec::new();
+        let mut dv: Vec<f64> = Vec::new();
+        for t in 1..=ntip {
+            if dates[t - 1].is_finite() {
+                idx.push(t);
+                dv.push(dates[t - 1]);
+            }
+        }
+        if idx.len() < 3 {
+            return self.clone();
+        }
+        let n = idx.len() as f64;
+        let mean_d = dv.iter().sum::<f64>() / n;
+        let a: Vec<f64> = dv.iter().map(|d| d - mean_d).collect();
+        let s_dd: f64 = a.iter().map(|v| v * v).sum();
+
+        let mut best: Option<(f64, Tree)> = None;
+
+        for u in 1..=total {
+            for &(v, l) in &adj[u] {
+                if v < u {
+                    continue;
+                }
+                let (du, sd) = self.dist_and_side(&adj, u, v);
+                // b_t = d_u(t) shifted to zero mean; c_t = side(t)*L shifted likewise
+                let mut b = Vec::with_capacity(idx.len());
+                let mut c = Vec::with_capacity(idx.len());
+                for &t in &idx {
+                    b.push(du[t]);
+                    c.push(sd[t] as f64 * l);
+                }
+                let mean_b = b.iter().sum::<f64>() / n;
+                let mean_c = c.iter().sum::<f64>() / n;
+                for x in b.iter_mut() {
+                    *x -= mean_b;
+                }
+                for x in c.iter_mut() {
+                    *x -= mean_c;
+                }
+                let s_ab: f64 = a.iter().zip(&b).map(|(p, q)| p * q).sum();
+                let s_ac: f64 = a.iter().zip(&c).map(|(p, q)| p * q).sum();
+                let s_bb: f64 = b.iter().map(|q| q * q).sum();
+                let s_bc: f64 = b.iter().zip(&c).map(|(p, q)| p * q).sum();
+                let s_cc: f64 = c.iter().map(|q| q * q).sum();
+
+                let attempts = if mean_edge > 0.0 {
+                    ((mtry as f64 * l / mean_edge).ceil() as usize).max(1)
+                } else {
+                    1
+                };
+                for step in 1..=attempts {
+                    let x = step as f64 / (attempts + 1) as f64;
+                    let cov = s_ab + x * s_ac;
+                    let var = s_bb + 2.0 * x * s_bc + x * x * s_cc;
+                    if var <= 0.0 || s_dd <= 0.0 {
+                        continue;
+                    }
+                    let corr = cov / (s_dd.sqrt() * var.sqrt());
+                    if corr.is_finite() && best.as_ref().map_or(true, |(bc, _)| corr > *bc) {
+                        best = Some((corr, self.reroot_at_edge(&adj, u, v, x)));
+                    }
+                }
+            }
+        }
+
+        match best {
+            Some((_, t)) => t,
+            None => self.clone(),
+        }
+    }
+
     /// Multiply every branch length by `factor`.
     ///
     /// Use this to convert a tree whose lengths are in substitutions per site
@@ -313,4 +565,54 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn test_reroot_preserves_tips_and_total_length() {
+        // unrooted tree: ((A:1,B:2):3,C:4,D:5);  (root has 3 children)
+        let t = parse_newick("((A:1,B:2):3,C:4,D:5);").unwrap();
+        assert_eq!(t.ntip, 4);
+        assert!(!t.is_rooted(), "trifurcating root means unrooted");
+        let adj = t.adjacency();
+        // re-root in the middle of the edge to C
+        let c = t.tip_index("C").unwrap();
+        let parent_of_c = t.parent[c];
+        let r = t.reroot_at_edge(&adj, parent_of_c, c, 0.5);
+        assert_eq!(r.tip_labels, t.tip_labels, "tip order must be preserved");
+        assert!(
+            (r.total_length() - t.total_length()).abs() < 1e-9,
+            "total length {} vs {}",
+            r.total_length(),
+            t.total_length()
+        );
+        assert!(r.is_rooted(), "re-rooted tree must be rooted");
+        // no node may be childless-but-internal, and exactly one root
+        let roots = (1..=r.total_nodes())
+            .filter(|&n| r.parent[n] == 0)
+            .count();
+        assert_eq!(roots, 1, "exactly one root expected");
+        for n in 1..=r.total_nodes() {
+            if !r.is_tip(n) {
+                assert!(!r.children[n].is_empty(), "internal node {} has no children", n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_init_root_prefers_temporal_signal() {
+        // Build a tree whose true root sits deep in the past, then check that
+        // init_root recovers a rooting at least as good as the input's.
+        // ((A:1,B:1):1,(C:1,D:1):1);  dates increase with distance from root
+        let t = parse_newick("((A:0.1,B:0.1):0.2,(C:0.1,D:0.1):0.2);").unwrap();
+        let dates = vec![2000.0, 2000.0, 2010.0, 2010.0]; // A,B old; C,D young
+        let corr_before = crate::roottip::root_to_tip_cor(&t, &dates);
+        let r = t.init_root(&dates, 5);
+        let corr_after = crate::roottip::root_to_tip_cor(&r, &dates);
+        assert!(
+            corr_after >= corr_before - 1e-9,
+            "init_root should not make the correlation worse: {} -> {}",
+            corr_before,
+            corr_after
+        );
+        assert_eq!(r.tip_labels, t.tip_labels);
+    }
+
 }
